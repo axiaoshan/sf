@@ -28,6 +28,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean encryptMd5Hooked = false;
     private static volatile boolean deviceInfoHooked = false;
     private static volatile boolean riskHooked = false;
+    private static volatile boolean cfgHooked = false;
+    private static volatile boolean saltProbed = false;
+    private static ClassLoader kpLoader = null;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lp) {
@@ -64,8 +67,13 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     } else if ("com.sf.keyprovider.KeyProvider".equals(name)) {
                         if (!encryptMd5Hooked || !deviceInfoHooked || !riskHooked) {
-                            log("[+] KeyProvider 已加载，开始 hook（算法核心）");
+                            log("[+] KeyProvider 已加载，开始 hook");
                             hookKeyProvider(cls);
+                        }
+                    } else if ("com.sf.keyprovider.generatedconfig.SfGeneratedConfig".equals(name)) {
+                        if (!cfgHooked) {
+                            log("[+] SfGeneratedConfig 已加载，开始 hook（盐配置读取）");
+                            hookSfGeneratedConfig(cls);
                         }
                     }
                 }
@@ -79,10 +87,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void tryDirectHook(ClassLoader cl) {
         try { hookHeaderInterceptor(XposedHelpers.findClass("com.sf.httpRequest.HeaderInterceptor", cl)); }
-        catch (Throwable t) { log("[-] HeaderInterceptor 未加载(正常): " + t.getClass().getSimpleName()); }
+        catch (Throwable t) { }
         try { hookTokenManager(XposedHelpers.findClass("com.sf.httpRequest.SYTTokenManager", cl)); }
         catch (Throwable t) { }
         try { hookKeyProvider(XposedHelpers.findClass("com.sf.keyprovider.KeyProvider", cl)); }
+        catch (Throwable t) { }
+        try { hookSfGeneratedConfig(XposedHelpers.findClass("com.sf.keyprovider.generatedconfig.SfGeneratedConfig", cl)); }
         catch (Throwable t) { }
     }
 
@@ -90,7 +100,7 @@ public class MainHook implements IXposedHookLoadPackage {
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
                 for (int i = 0; i < 60; i++) {
-                    if (md5Hooked && tokenHooked && encryptMd5Hooked) break;
+                    if (md5Hooked && tokenHooked && encryptMd5Hooked && cfgHooked) break;
                     try { Thread.sleep(1000); } catch (Throwable e) { }
                     tryDirectHook(cl);
                 }
@@ -107,17 +117,11 @@ public class MainHook implements IXposedHookLoadPackage {
                         String.class, String.class, String.class,
                         new XC_MethodHook() {
                             @Override protected void afterHookedMethod(MethodHookParam p) {
-                                String a = argStr(p.args, 0);
-                                String b = argStr(p.args, 1);
-                                String c = argStr(p.args, 2);
-                                String result = p.getResult() == null ? "null" : p.getResult().toString();
                                 log("=== getSytTokenMd5 ===");
-                                log("  arg0 = [" + a + "]");
-                                log("  arg1 = [" + b + "]");
-                                log("  arg2 = [" + c + "]");
-                                log("  result = " + result);
-                                String match = bruteMd5(result, a, b, c);
-                                log("  >>> 拼接匹配: " + (match == null ? "未找到" : match));
+                                log("  arg0 = [" + argStr(p.args, 0) + "]");
+                                log("  arg1 = [" + argStr(p.args, 1) + "]");
+                                log("  arg2 = [" + argStr(p.args, 2) + "]");
+                                log("  result = " + p.getResult());
                             }
                         });
                 md5Hooked = true;
@@ -130,17 +134,16 @@ public class MainHook implements IXposedHookLoadPackage {
                         new XC_MethodHook() {
                             @Override protected void afterHookedMethod(MethodHookParam p) {
                                 log("=== generateHeaderMap ===");
-                                log("  arg = [" + argStr(p.args, 0) + "]");
                                 Object r = p.getResult();
                                 if (r instanceof Map) {
                                     Map m = (Map) r;
                                     for (Object k : m.keySet()) log("  header[" + k + "] = " + m.get(k));
-                                } else log("  result = " + r);
+                                }
                             }
                         });
                 headerMapHooked = true;
                 log("[+] hooked generateHeaderMap");
-            } catch (Throwable t) { log("[-] hook generateHeaderMap FAILED: " + t); }
+            } catch (Throwable t) { }
         }
         if (!deviceHooked) {
             try {
@@ -150,7 +153,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 });
                 deviceHooked = true;
-                log("[+] hooked getDeviceId");
             } catch (Throwable t) { }
         }
     }
@@ -162,8 +164,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     @Override protected void afterHookedMethod(MethodHookParam p) { log("  [getToken] = " + p.getResult()); }
                 });
                 tokenHooked = true;
-                log("[+] hooked getToken");
-            } catch (Throwable t) { log("[-] hook getToken FAILED: " + t); }
+            } catch (Throwable t) { }
         }
         if (!saltHooked) {
             try {
@@ -171,13 +172,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     @Override protected void afterHookedMethod(MethodHookParam p) { log("  [getSalt] = " + p.getResult()); }
                 });
                 saltHooked = true;
-                log("[+] hooked getSalt");
             } catch (Throwable t) { }
         }
     }
 
-    /** 算法核心：KeyProvider.encryptMD5(数据, 配置Map) —— Map 里很可能装着盐 */
     private void hookKeyProvider(Class<?> cls) {
+        kpLoader = cls.getClassLoader();
         if (!encryptMd5Hooked) {
             try {
                 XposedHelpers.findAndHookMethod(cls, "encryptMD5", String.class, Map.class,
@@ -187,13 +187,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                 log("  str = [" + argStr(p.args, 0) + "]");
                                 Object m = p.args[1];
                                 if (m instanceof Map) {
-                                    for (Object k : ((Map) m).keySet()) {
-                                        log("  map[" + k + "] = " + ((Map) m).get(k));
-                                    }
-                                } else {
-                                    log("  map = " + m);
+                                    for (Object k : ((Map) m).keySet()) log("  map[" + k + "] = " + ((Map) m).get(k));
                                 }
                                 log("  result = " + p.getResult());
+                                // 第一次命中时，主动探测盐配置
+                                if (!saltProbed) probeSaltConfig();
                             }
                         });
                 encryptMd5Hooked = true;
@@ -212,8 +210,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 });
                 deviceInfoHooked = true;
-                log("[+] hooked KeyProvider.getDeviceInfo");
-            } catch (Throwable t) { log("[-] hook getDeviceInfo FAILED: " + t); }
+            } catch (Throwable t) { }
         }
         if (!riskHooked) {
             try {
@@ -227,40 +224,67 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         });
                 riskHooked = true;
-                log("[+] hooked KeyProvider.encryptRiskContext");
             } catch (Throwable t) { }
+        }
+    }
+
+    /** 关键：SfGeneratedConfig.getStringForKey 能直接读出配置明文（盐） */
+    private void hookSfGeneratedConfig(Class<?> cls) {
+        if (cfgHooked) return;
+        try {
+            XposedHelpers.findAndHookMethod(cls, "getStringForKey", String.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            log("[CFG] getStringForKey(" + argStr(p.args, 0) + ") = " + p.getResult());
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(cls, "getDictionaryForKey", String.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            log("[CFG] getDictionaryForKey(" + argStr(p.args, 0) + ") = " + p.getResult());
+                        }
+                    });
+            cfgHooked = true;
+            log("[+] hooked SfGeneratedConfig.getStringForKey / getDictionaryForKey");
+        } catch (Throwable t) {
+            log("[-] hook SfGeneratedConfig FAILED: " + t);
+        }
+    }
+
+    /** 主动探测盐配置：遍历所有可能的盐 key，读出明文 */
+    private void probeSaltConfig() {
+        saltProbed = true;
+        try {
+            Class<?> cfg = XposedHelpers.findClass("com.sf.keyprovider.generatedconfig.SfGeneratedConfig", kpLoader);
+            String[] keys = {
+                "encryptMD5", "tokenSaltkeys", "bodySaltkeys", "encryptSaltkeys",
+                "rsaPrivateKey", "tokenSalt", "bodySalt", "encryptSalt",
+                "sytSHA3Salt", "sytHttpEncryption", "saltEncryption", "rsaEncryption",
+                "tokenSaltKey", "bodySaltKey", "encryptSaltKey"
+            };
+            log("===== 开始探测盐配置 =====");
+            for (String k : keys) {
+                try {
+                    Object v = XposedHelpers.callStaticMethod(cfg, "getStringForKey", k);
+                    log("[PROBE] getStringForKey(" + k + ") = " + v);
+                } catch (Throwable t) {
+                    log("[PROBE] getStringForKey(" + k + ") ERR: " + t.getClass().getSimpleName());
+                }
+            }
+            for (String k : keys) {
+                try {
+                    Object v = XposedHelpers.callStaticMethod(cfg, "getDictionaryForKey", k);
+                    log("[PROBE] getDictionaryForKey(" + k + ") = " + v);
+                } catch (Throwable t) { }
+            }
+            log("===== 盐配置探测结束 =====");
+        } catch (Throwable t) {
+            log("[PROBE] 探测失败: " + t);
         }
     }
 
     private static String argStr(Object[] args, int i) {
         return (i < args.length && args[i] != null) ? args[i].toString() : "null";
-    }
-
-    private static String md5hex(String s) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] d = md.digest(s.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : d) sb.append(String.format("%02x", b));
-            return sb.toString();
-        } catch (Exception e) { return ""; }
-    }
-
-    private static String bruteMd5(String result, String a, String b, String c) {
-        if (result == null || result.length() != 32) return null;
-        String[] vals = {a, b, c};
-        String[] names = {"a", "b", "c"};
-        List<String[]> candidates = new ArrayList<>();
-        int[][] perms = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
-        for (int[] p : perms) candidates.add(new String[]{names[p[0]]+names[p[1]]+names[p[2]], vals[p[0]]+vals[p[1]]+vals[p[2]]});
-        int[][] pairs = {{0,1},{1,0},{0,2},{2,0},{1,2},{2,1}};
-        for (int[] p : pairs) candidates.add(new String[]{names[p[0]]+names[p[1]], vals[p[0]]+vals[p[1]]});
-        for (int i = 0; i < 3; i++) candidates.add(new String[]{names[i], vals[i]});
-        String[] seps = {"", "&", "|", "_", "-", ":", ";"};
-        for (String sep : seps) for (int[] p : perms)
-            candidates.add(new String[]{names[p[0]]+"+"+sep+"+"+names[p[1]]+"+"+sep+"+"+names[p[2]], vals[p[0]]+sep+vals[p[1]]+sep+vals[p[2]]});
-        for (String[] cand : candidates) if (md5hex(cand[1]).equalsIgnoreCase(result)) return "MD5(" + cand[1] + ")  [即 " + cand[0] + "]";
-        return null;
     }
 
     private static void log(String msg) {
