@@ -40,6 +40,7 @@ public class MainHook implements IXposedHookLoadPackage {
         log("========== SFHook loaded, pkg=" + lp.packageName + " ==========");
         hookClassLoader();
         tryDirectHook(lp.classLoader);
+        startRetryThread(lp.classLoader);
     }
 
     private void hookClassLoader() {
@@ -74,6 +75,21 @@ public class MainHook implements IXposedHookLoadPackage {
         catch (Throwable t) { }
         try { hookKeyProvider(XposedHelpers.findClass("com.sf.keyprovider.KeyProvider", cl)); }
         catch (Throwable t) { }
+    }
+
+    /** 后台轮询重试：娜迦类延迟加载，每秒 findClass 直到 hook 成功 */
+    private void startRetryThread(final ClassLoader cl) {
+        Thread t = new Thread(new Runnable() {
+            @Override public void run() {
+                for (int i = 0; i < 60; i++) {
+                    if (md5Hooked && encryptMd5Hooked) break;
+                    try { Thread.sleep(1000); } catch (Throwable e) { }
+                    tryDirectHook(cl);
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     private void hookHeaderInterceptor(Class<?> cls) {
