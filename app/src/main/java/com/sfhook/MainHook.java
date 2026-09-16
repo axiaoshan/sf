@@ -2,12 +2,14 @@ package com.sfhook;
 
 import android.util.Log;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -19,27 +21,25 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "SFTokenHook";
     private static final String TARGET_PKG = "com.sf.activity";
+    private static final String CMD_PATH = "/data/data/com.sf.activity/files/syt_cmd.txt";
+    private static final String RESULT_PATH = "/data/data/com.sf.activity/files/syt_result.txt";
 
     private static volatile boolean md5Hooked = false;
-    private static volatile boolean headerMapHooked = false;
-    private static volatile boolean deviceHooked = false;
-    private static volatile boolean tokenHooked = false;
-    private static volatile boolean saltHooked = false;
     private static volatile boolean encryptMd5Hooked = false;
-    private static volatile boolean deviceInfoHooked = false;
-    private static volatile boolean riskHooked = false;
-    private static volatile boolean cfgHooked = false;
-    private static volatile boolean saltProbed = false;
+    private static volatile boolean tokenServiceStarted = false;
+    private static volatile int dumpCount = 0;
+
     private static ClassLoader kpLoader = null;
+    private static Class<?> keyProviderClass = null;
+    // 首次 hook 时记录的固定 map 值（deviceId/jsbundle/clientVersion/languageCode/regionCode）
+    private static final Map<String, String> fixedMap = new HashMap<>();
 
     @Override
     public void handleLoadPackage(LoadPackageParam lp) {
         if (!TARGET_PKG.equals(lp.packageName)) return;
         log("========== SFHook loaded, pkg=" + lp.packageName + " ==========");
-
         hookClassLoader();
         tryDirectHook(lp.classLoader);
-        startRetryThread(lp.classLoader);
     }
 
     private void hookClassLoader() {
@@ -56,25 +56,9 @@ public class MainHook implements IXposedHookLoadPackage {
                     Class<?> cls = (Class<?>) result;
 
                     if ("com.sf.httpRequest.HeaderInterceptor".equals(name)) {
-                        if (!md5Hooked || !headerMapHooked || !deviceHooked) {
-                            log("[+] HeaderInterceptor 已加载，开始 hook");
-                            hookHeaderInterceptor(cls);
-                        }
-                    } else if ("com.sf.httpRequest.SYTTokenManager".equals(name)) {
-                        if (!tokenHooked || !saltHooked) {
-                            log("[+] SYTTokenManager 已加载，开始 hook");
-                            hookTokenManager(cls);
-                        }
+                        if (!md5Hooked) hookHeaderInterceptor(cls);
                     } else if ("com.sf.keyprovider.KeyProvider".equals(name)) {
-                        if (!encryptMd5Hooked || !deviceInfoHooked || !riskHooked) {
-                            log("[+] KeyProvider 已加载，开始 hook");
-                            hookKeyProvider(cls);
-                        }
-                    } else if ("com.sf.keyprovider.generatedconfig.SfGeneratedConfig".equals(name)) {
-                        if (!cfgHooked) {
-                            log("[+] SfGeneratedConfig 已加载，开始 hook（盐配置读取）");
-                            hookSfGeneratedConfig(cls);
-                        }
+                        if (!encryptMd5Hooked) hookKeyProvider(cls);
                     }
                 }
             };
@@ -88,21 +72,128 @@ public class MainHook implements IXposedHookLoadPackage {
     private void tryDirectHook(ClassLoader cl) {
         try { hookHeaderInterceptor(XposedHelpers.findClass("com.sf.httpRequest.HeaderInterceptor", cl)); }
         catch (Throwable t) { }
-        try { hookTokenManager(XposedHelpers.findClass("com.sf.httpRequest.SYTTokenManager", cl)); }
-        catch (Throwable t) { }
         try { hookKeyProvider(XposedHelpers.findClass("com.sf.keyprovider.KeyProvider", cl)); }
-        catch (Throwable t) { }
-        try { hookSfGeneratedConfig(XposedHelpers.findClass("com.sf.keyprovider.generatedconfig.SfGeneratedConfig", cl)); }
         catch (Throwable t) { }
     }
 
-    private void startRetryThread(final ClassLoader cl) {
+    private void hookHeaderInterceptor(Class<?> cls) {
+        if (md5Hooked) return;
+        try {
+            XposedHelpers.findAndHookMethod(cls, "getSytTokenMd5",
+                    String.class, String.class, String.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            log("=== getSytTokenMd5 ===");
+                            log("  arg0 = [" + argStr(p.args, 0) + "]");
+                            log("  arg1 = [" + argStr(p.args, 1) + "]");
+                            log("  arg2 = [" + argStr(p.args, 2) + "]");
+                            log("  result = " + p.getResult());
+                        }
+                    });
+            md5Hooked = true;
+            log("[+] hooked getSytTokenMd5");
+        } catch (Throwable t) {
+            log("[-] hook getSytTokenMd5 FAILED: " + t);
+        }
+    }
+
+    private void hookKeyProvider(Class<?> cls) {
+        kpLoader = cls.getClassLoader();
+        keyProviderClass = cls;
+        if (encryptMd5Hooked) return;
+        try {
+            XposedHelpers.findAndHookMethod(cls, "encryptMD5", String.class, Map.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            log("=== KeyProvider.encryptMD5 ===");
+                            log("  str = [" + argStr(p.args, 0) + "]");
+                            Object m = p.args[1];
+                            if (m instanceof Map) {
+                                for (Object k : ((Map) m).keySet()) {
+                                    log("  map[" + k + "] = " + ((Map) m).get(k));
+                                }
+                            }
+                            log("  result = " + p.getResult());
+                            // 首次记录固定 map 值（去掉 timeInterval）
+                            if (fixedMap.isEmpty() && m instanceof Map) {
+                                synchronized (fixedMap) {
+                                    for (Object k : ((Map) m).keySet()) {
+                                        String ks = k.toString();
+                                        if (!"timeInterval".equals(ks) && ((Map) m).get(k) != null) {
+                                            fixedMap.put(ks, ((Map) m).get(k).toString());
+                                        }
+                                    }
+                                }
+                                log("[TOKEN] 已记录固定 map: " + fixedMap);
+                            }
+                            // MD5 刚执行完，立即 dump 代码段（抓明文页）
+                            if (dumpCount < 3) {
+                                dumpCount++;
+                                dumpCode("after_md5_" + dumpCount + "_" + System.currentTimeMillis());
+                            }
+                        }
+                    });
+            encryptMd5Hooked = true;
+            log("[+] hooked KeyProvider.encryptMD5");
+            startTokenService();
+        } catch (Throwable t) {
+            log("[-] hook encryptMD5 FAILED: " + t);
+        }
+    }
+
+    /** 在 MD5 刚执行完时，dump libKeyProvider.so 代码段（进程内读 /proc/self/mem） */
+    private void dumpCode(String tag) {
+        try {
+            String maps = readFile("/proc/self/maps");
+            long start = -1, end = -1;
+            for (String line : maps.split("\n")) {
+                if (line.contains("libKeyProvider.so") && line.contains("r-xp")) {
+                    String[] parts = line.trim().split("\\s+");
+                    String[] range = parts[0].split("-");
+                    start = Long.parseLong(range[0], 16);
+                    end = Long.parseLong(range[1], 16);
+                    break;
+                }
+            }
+            if (start < 0) {
+                log("[DUMP] 未找到 libKeyProvider.so 代码段");
+                return;
+            }
+            RandomAccessFile mem = new RandomAccessFile("/proc/self/mem", "r");
+            mem.seek(start);
+            byte[] buf = new byte[(int) (end - start)];
+            mem.readFully(buf);
+            mem.close();
+            String out = "/data/data/com.sf.activity/files/" + tag + ".bin";
+            writeFile(out, buf);
+            log("[DUMP] 代码段 dump 完成: " + out + " (" + buf.length + " bytes)");
+        } catch (Throwable t) {
+            log("[DUMP] 失败: " + t.getClass().getSimpleName() + " " + t.getMessage());
+        }
+    }
+
+    /** 主动生成 token 服务：轮询命令文件，调用 encryptMD5 生成任意 body 的 sytToken */
+    private void startTokenService() {
+        if (tokenServiceStarted) return;
+        tokenServiceStarted = true;
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
-                for (int i = 0; i < 60; i++) {
-                    if (md5Hooked && tokenHooked && encryptMd5Hooked && cfgHooked) break;
-                    try { Thread.sleep(1000); } catch (Throwable e) { }
-                    tryDirectHook(cl);
+                String lastCmd = "";
+                log("[TOKEN] token 生成服务已启动，监听 " + CMD_PATH);
+                while (true) {
+                    try {
+                        Thread.sleep(500);
+                        String cmd = readFile(CMD_PATH);
+                        if (cmd != null && !cmd.isEmpty() && !cmd.equals(lastCmd)) {
+                            lastCmd = cmd;
+                            log("[TOKEN] 收到命令 body: " + cmd);
+                            String token = genToken(cmd);
+                            writeFile(RESULT_PATH, token);
+                            log("[TOKEN] 生成 token: " + token);
+                        }
+                    } catch (Throwable e) {
+                        log("[TOKEN] 服务异常: " + e);
+                    }
                 }
             }
         });
@@ -110,195 +201,20 @@ public class MainHook implements IXposedHookLoadPackage {
         t.start();
     }
 
-    private void hookHeaderInterceptor(Class<?> cls) {
-        if (!md5Hooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "getSytTokenMd5",
-                        String.class, String.class, String.class,
-                        new XC_MethodHook() {
-                            @Override protected void afterHookedMethod(MethodHookParam p) {
-                                log("=== getSytTokenMd5 ===");
-                                log("  arg0 = [" + argStr(p.args, 0) + "]");
-                                log("  arg1 = [" + argStr(p.args, 1) + "]");
-                                log("  arg2 = [" + argStr(p.args, 2) + "]");
-                                log("  result = " + p.getResult());
-                            }
-                        });
-                md5Hooked = true;
-                log("[+] hooked getSytTokenMd5");
-            } catch (Throwable t) { log("[-] hook getSytTokenMd5 FAILED: " + t); }
-        }
-        if (!headerMapHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "generateHeaderMap", String.class,
-                        new XC_MethodHook() {
-                            @Override protected void afterHookedMethod(MethodHookParam p) {
-                                log("=== generateHeaderMap ===");
-                                Object r = p.getResult();
-                                if (r instanceof Map) {
-                                    Map m = (Map) r;
-                                    for (Object k : m.keySet()) log("  header[" + k + "] = " + m.get(k));
-                                }
-                            }
-                        });
-                headerMapHooked = true;
-                log("[+] hooked generateHeaderMap");
-            } catch (Throwable t) { }
-        }
-        if (!deviceHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "getDeviceId", new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) {
-                        log("  [getDeviceId] = " + p.getResult());
-                    }
-                });
-                deviceHooked = true;
-            } catch (Throwable t) { }
-        }
-    }
-
-    private void hookTokenManager(Class<?> cls) {
-        if (!tokenHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "getToken", new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) { log("  [getToken] = " + p.getResult()); }
-                });
-                tokenHooked = true;
-            } catch (Throwable t) { }
-        }
-        if (!saltHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "getSalt", new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) { log("  [getSalt] = " + p.getResult()); }
-                });
-                saltHooked = true;
-            } catch (Throwable t) { }
-        }
-    }
-
-    private void hookKeyProvider(Class<?> cls) {
-        kpLoader = cls.getClassLoader();
-        if (!encryptMd5Hooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "encryptMD5", String.class, Map.class,
-                        new XC_MethodHook() {
-                            @Override protected void afterHookedMethod(MethodHookParam p) {
-                                log("=== KeyProvider.encryptMD5 ===");
-                                log("  str = [" + argStr(p.args, 0) + "]");
-                                Object m = p.args[1];
-                                if (m instanceof Map) {
-                                    for (Object k : ((Map) m).keySet()) log("  map[" + k + "] = " + ((Map) m).get(k));
-                                }
-                                log("  result = " + p.getResult());
-                                // 第一次命中时，主动探测盐配置
-                                if (!saltProbed) probeSaltConfig();
-                            }
-                        });
-                encryptMd5Hooked = true;
-                log("[+] hooked KeyProvider.encryptMD5");
-            } catch (Throwable t) { log("[-] hook encryptMD5 FAILED: " + t); }
-        }
-        if (!deviceInfoHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "getDeviceInfo", new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) {
-                        Object r = p.getResult();
-                        log("=== KeyProvider.getDeviceInfo ===");
-                        if (r instanceof Map) {
-                            for (Object k : ((Map) r).keySet()) log("  [" + k + "] = " + ((Map) r).get(k));
-                        } else log("  result = " + r);
-                    }
-                });
-                deviceInfoHooked = true;
-            } catch (Throwable t) { }
-        }
-        if (!riskHooked) {
-            try {
-                XposedHelpers.findAndHookMethod(cls, "encryptRiskContext", String.class, String.class,
-                        new XC_MethodHook() {
-                            @Override protected void afterHookedMethod(MethodHookParam p) {
-                                log("=== KeyProvider.encryptRiskContext ===");
-                                log("  arg0 = [" + argStr(p.args, 0) + "]");
-                                log("  arg1 = [" + argStr(p.args, 1) + "]");
-                                log("  result = " + p.getResult());
-                            }
-                        });
-                riskHooked = true;
-            } catch (Throwable t) { }
-        }
-    }
-
-    /** 关键：SfGeneratedConfig.getStringForKey 能直接读出配置明文（盐） */
-    private void hookSfGeneratedConfig(Class<?> cls) {
-        if (cfgHooked) return;
+    /** 调用 KeyProvider.encryptMD5(body, map) 生成 token，map 用记录的固定值 + 当前时间戳 */
+    private String genToken(String body) {
         try {
-            XposedHelpers.findAndHookMethod(cls, "getStringForKey", String.class,
-                    new XC_MethodHook() {
-                        @Override protected void afterHookedMethod(MethodHookParam p) {
-                            log("[CFG] getStringForKey(" + argStr(p.args, 0) + ") = " + p.getResult());
-                        }
-                    });
-            XposedHelpers.findAndHookMethod(cls, "getDictionaryForKey", String.class,
-                    new XC_MethodHook() {
-                        @Override protected void afterHookedMethod(MethodHookParam p) {
-                            log("[CFG] getDictionaryForKey(" + argStr(p.args, 0) + ") = " + p.getResult());
-                        }
-                    });
-            cfgHooked = true;
-            log("[+] hooked SfGeneratedConfig.getStringForKey / getDictionaryForKey");
+            if (keyProviderClass == null) return "ERROR: KeyProvider 未加载";
+            Map<String, String> map = new HashMap<>();
+            synchronized (fixedMap) {
+                map.putAll(fixedMap);
+            }
+            map.put("timeInterval", String.valueOf(System.currentTimeMillis()));
+            log("[TOKEN] 构造 map: " + map);
+            Object result = XposedHelpers.callStaticMethod(keyProviderClass, "encryptMD5", body, map);
+            return result == null ? "null" : result.toString();
         } catch (Throwable t) {
-            log("[-] hook SfGeneratedConfig FAILED: " + t);
-        }
-    }
-
-    /** 主动探测盐配置：遍历所有可能的盐 key，读出明文（重点字典） */
-    private void probeSaltConfig() {
-        saltProbed = true;
-        try {
-            Class<?> cfg = XposedHelpers.findClass("com.sf.keyprovider.generatedconfig.SfGeneratedConfig", kpLoader);
-            String[] stringKeys = {
-                "encryptMD5", "tokenSaltkeys", "bodySaltkeys", "encryptSaltkeys",
-                "rsaPrivateKey", "sytSHA3Salt", "saltEncryption", "rsaEncryption"
-            };
-            String[] dictKeys = {
-                "sytHttpEncryption", "rsaEncryption", "saltEncryption", "sytSHA3Salt",
-                "encryptMD5", "tokenSaltkeys", "bodySaltkeys", "encryptSaltkeys"
-            };
-            log("===== 开始探测盐配置 =====");
-            for (String k : stringKeys) {
-                try {
-                    Object v = XposedHelpers.callStaticMethod(cfg, "getStringForKey", k);
-                    log("[PROBE] getStringForKey(" + k + ") = " + v);
-                } catch (Throwable t) {
-                    log("[PROBE] getStringForKey(" + k + ") ERR: " + t.getClass().getSimpleName());
-                }
-            }
-            for (String k : dictKeys) {
-                try {
-                    Object v = XposedHelpers.callStaticMethod(cfg, "getDictionaryForKey", k);
-                    if (v instanceof Map) {
-                        log("[PROBE] getDictionaryForKey(" + k + ") = {");
-                        for (Object mk : ((Map) v).keySet()) {
-                            log("[PROBE]    [" + mk + "] = " + ((Map) v).get(mk));
-                        }
-                        log("[PROBE] }");
-                    } else {
-                        log("[PROBE] getDictionaryForKey(" + k + ") = " + v);
-                    }
-                } catch (Throwable t) {
-                    log("[PROBE] getDictionaryForKey(" + k + ") ERR: " + t.getClass().getSimpleName());
-                }
-            }
-            // 探测 rsaPrivateKey 验证 getStringForKey 是否可用
-            try {
-                Object rk = XposedHelpers.callStaticMethod(cfg, "getStringForKey", "rsaPrivateKey");
-                log("[PROBE] 验证 getStringForKey(rsaPrivateKey) = " + (rk == null ? "null" : rk.toString().substring(0, Math.min(60, rk.toString().length())) + "..."));
-            } catch (Throwable t) {
-                log("[PROBE] 验证 rsaPrivateKey ERR: " + t);
-            }
-            log("===== 盐配置探测结束 =====");
-        } catch (Throwable t) {
-            log("[PROBE] 探测失败: " + t);
+            return "ERROR: " + t.getClass().getSimpleName() + " " + t.getMessage();
         }
     }
 
@@ -306,10 +222,45 @@ public class MainHook implements IXposedHookLoadPackage {
         return (i < args.length && args[i] != null) ? args[i].toString() : "null";
     }
 
+    private static String readFile(String path) {
+        try {
+            File f = new File(path);
+            if (!f.exists()) return "";
+            FileInputStream fis = new FileInputStream(f);
+            BufferedReader br = new BufferedReader(new InputStreamReader(fis, StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+            br.close();
+            return sb.toString().trim();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static void writeFile(String path, String content) {
+        try {
+            File f = new File(path);
+            if (f.getParentFile() != null) f.getParentFile().mkdirs();
+            FileOutputStream fos = new FileOutputStream(f);
+            fos.write(content.getBytes(StandardCharsets.UTF_8));
+            fos.close();
+        } catch (Throwable e) { }
+    }
+
+    private static void writeFile(String path, byte[] content) {
+        try {
+            File f = new File(path);
+            if (f.getParentFile() != null) f.getParentFile().mkdirs();
+            FileOutputStream fos = new FileOutputStream(f);
+            fos.write(content);
+            fos.close();
+        } catch (Throwable e) { }
+    }
+
     private static void log(String msg) {
         Log.i(TAG, msg);
         XposedBridge.log(msg);
-        // 多路径写文件，Android 11+ /sdcard 根目录会被 scoped storage 拦截，优先写 App 自有目录
         String[] paths = {
             "/data/data/com.sf.activity/files/sytToken_hook.txt",
             "/sdcard/Download/sytToken_hook.txt",
