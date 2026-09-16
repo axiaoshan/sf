@@ -202,10 +202,16 @@ public class MainHook implements IXposedHookLoadPackage {
                         String cmd = readFile(CMD_PATH);
                         if (cmd != null && !cmd.isEmpty() && !cmd.equals(lastCmd)) {
                             lastCmd = cmd;
-                            log("[TOKEN] 收到命令 body: " + cmd);
-                            String token = genToken(cmd);
-                            writeFile(RESULT_PATH, token);
-                            log("[TOKEN] 生成 token: " + token);
+                            log("[TOKEN] 收到命令: " + cmd);
+                            String out;
+                            if ("DIFF".equals(cmd.trim())) {
+                                out = diffTest();
+                                log("[DIFF] 差分测试完成");
+                            } else {
+                                out = genToken(cmd);
+                                log("[TOKEN] 生成 token: " + out);
+                            }
+                            writeFile(RESULT_PATH, out);
                         }
                     } catch (Throwable e) {
                         log("[TOKEN] 服务异常: " + e);
@@ -236,6 +242,55 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static String argStr(Object[] args, int i) {
         return (i < args.length && args[i] != null) ? args[i].toString() : "null";
+    }
+
+    /** 差分测试：改一个输入看输出变化，确定哪些参数参与 MD5 + 盐的位置 */
+    private String diffTest() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            if (keyProviderClass == null) return "ERROR: KeyProvider 未加载";
+            String body0 = "{\"memberId\":\"\"}";
+            Map<String, String> map0 = new HashMap<>();
+            synchronized (fixedMap) { map0.putAll(fixedMap); }
+            map0.put("timeInterval", "1789559580000");  // 固定时间戳，排除时间干扰
+
+            sb.append("基线        body0+map0     = ").append(call(body0, map0)).append("\n");
+            sb.append("重复        body0+map0     = ").append(call(body0, map0)).append("\n");
+            sb.append("空body      ''+map0        = ").append(call("", map0)).append("\n");
+            sb.append("body=a      a+map0         = ").append(call("a", map0)).append("\n");
+            sb.append("body=ab     ab+map0        = ").append(call("ab", map0)).append("\n");
+            sb.append("body=abc    abc+map0       = ").append(call("abc", map0)).append("\n");
+
+            Map m = new HashMap<>(map0); m.put("timeInterval", "0");
+            sb.append("ts=0        body0+ts0      = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("timeInterval", "1");
+            sb.append("ts=1        body0+ts1      = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("deviceId", "x");
+            sb.append("deviceId=x  body0+did=x    = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("jsbundle", "y");
+            sb.append("jsbundle=y  body0+js=y     = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("regionCode", "z");
+            sb.append("region=z    body0+rc=z     = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("languageCode", "w");
+            sb.append("lang=w      body0+lc=w     = ").append(call(body0, m)).append("\n");
+            m = new HashMap<>(map0); m.put("clientVersion", "v");
+            sb.append("clientVer=v body0+cv=v     = ").append(call(body0, m)).append("\n");
+
+            Map empty = new HashMap<>();
+            sb.append("空map       body0+{}       = ").append(call(body0, empty)).append("\n");
+        } catch (Throwable t) {
+            sb.append("DIFF ERROR: ").append(t).append("\n");
+        }
+        return sb.toString();
+    }
+
+    private String call(String body, Map<String, String> map) {
+        try {
+            Object r = XposedHelpers.callStaticMethod(keyProviderClass, "encryptMD5", body, map);
+            return r == null ? "null" : r.toString();
+        } catch (Throwable t) {
+            return "ERR:" + t.getClass().getSimpleName();
+        }
     }
 
     private static String readFile(String path) {
