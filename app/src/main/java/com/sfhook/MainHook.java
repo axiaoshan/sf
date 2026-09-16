@@ -194,8 +194,17 @@ public class MainHook implements IXposedHookLoadPackage {
         tokenServiceStarted = true;
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
+                log("[TOKEN] token 生成服务已启动");
+                // 等 fixedMap 记录好（encryptMD5 首次 hook 时记录），最多等 15 秒
+                for (int i = 0; i < 15 && fixedMap.isEmpty(); i++) {
+                    try { Thread.sleep(1000); } catch (Throwable e) { }
+                }
+                log("[DIFF] 主动执行差分测试（fixedMap=" + (fixedMap.isEmpty() ? "空" : fixedMap) + "）");
+                String diff = diffTest();
+                writeFile(RESULT_PATH, diff);
+                log("[DIFF] 差分测试结果已写入 result 文件");
+
                 String lastCmd = "";
-                log("[TOKEN] token 生成服务已启动，监听 " + CMD_PATH);
                 while (true) {
                     try {
                         Thread.sleep(500);
