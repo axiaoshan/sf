@@ -251,19 +251,21 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 主动探测盐配置：遍历所有可能的盐 key，读出明文 */
+    /** 主动探测盐配置：遍历所有可能的盐 key，读出明文（重点字典） */
     private void probeSaltConfig() {
         saltProbed = true;
         try {
             Class<?> cfg = XposedHelpers.findClass("com.sf.keyprovider.generatedconfig.SfGeneratedConfig", kpLoader);
-            String[] keys = {
+            String[] stringKeys = {
                 "encryptMD5", "tokenSaltkeys", "bodySaltkeys", "encryptSaltkeys",
-                "rsaPrivateKey", "tokenSalt", "bodySalt", "encryptSalt",
-                "sytSHA3Salt", "sytHttpEncryption", "saltEncryption", "rsaEncryption",
-                "tokenSaltKey", "bodySaltKey", "encryptSaltKey"
+                "rsaPrivateKey", "sytSHA3Salt", "saltEncryption", "rsaEncryption"
+            };
+            String[] dictKeys = {
+                "sytHttpEncryption", "rsaEncryption", "saltEncryption", "sytSHA3Salt",
+                "encryptMD5", "tokenSaltkeys", "bodySaltkeys", "encryptSaltkeys"
             };
             log("===== 开始探测盐配置 =====");
-            for (String k : keys) {
+            for (String k : stringKeys) {
                 try {
                     Object v = XposedHelpers.callStaticMethod(cfg, "getStringForKey", k);
                     log("[PROBE] getStringForKey(" + k + ") = " + v);
@@ -271,11 +273,28 @@ public class MainHook implements IXposedHookLoadPackage {
                     log("[PROBE] getStringForKey(" + k + ") ERR: " + t.getClass().getSimpleName());
                 }
             }
-            for (String k : keys) {
+            for (String k : dictKeys) {
                 try {
                     Object v = XposedHelpers.callStaticMethod(cfg, "getDictionaryForKey", k);
-                    log("[PROBE] getDictionaryForKey(" + k + ") = " + v);
-                } catch (Throwable t) { }
+                    if (v instanceof Map) {
+                        log("[PROBE] getDictionaryForKey(" + k + ") = {");
+                        for (Object mk : ((Map) v).keySet()) {
+                            log("[PROBE]    [" + mk + "] = " + ((Map) v).get(mk));
+                        }
+                        log("[PROBE] }");
+                    } else {
+                        log("[PROBE] getDictionaryForKey(" + k + ") = " + v);
+                    }
+                } catch (Throwable t) {
+                    log("[PROBE] getDictionaryForKey(" + k + ") ERR: " + t.getClass().getSimpleName());
+                }
+            }
+            // 探测 rsaPrivateKey 验证 getStringForKey 是否可用
+            try {
+                Object rk = XposedHelpers.callStaticMethod(cfg, "getStringForKey", "rsaPrivateKey");
+                log("[PROBE] 验证 getStringForKey(rsaPrivateKey) = " + (rk == null ? "null" : rk.toString().substring(0, Math.min(60, rk.toString().length())) + "..."));
+            } catch (Throwable t) {
+                log("[PROBE] 验证 rsaPrivateKey ERR: " + t);
             }
             log("===== 盐配置探测结束 =====");
         } catch (Throwable t) {
@@ -290,11 +309,21 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void log(String msg) {
         Log.i(TAG, msg);
         XposedBridge.log(msg);
-        try {
-            File f = new File("/sdcard/sytToken_hook.txt");
-            FileOutputStream fos = new FileOutputStream(f, true);
-            fos.write((System.currentTimeMillis() + " " + msg + "\n").getBytes(StandardCharsets.UTF_8));
-            fos.close();
-        } catch (Throwable e) { }
+        // 多路径写文件，Android 11+ /sdcard 根目录会被 scoped storage 拦截，优先写 App 自有目录
+        String[] paths = {
+            "/data/data/com.sf.activity/files/sytToken_hook.txt",
+            "/sdcard/Download/sytToken_hook.txt",
+            "/sdcard/sytToken_hook.txt",
+        };
+        for (String p : paths) {
+            try {
+                File f = new File(p);
+                if (f.getParentFile() != null) f.getParentFile().mkdirs();
+                FileOutputStream fos = new FileOutputStream(f, true);
+                fos.write((System.currentTimeMillis() + " " + msg + "\n").getBytes(StandardCharsets.UTF_8));
+                fos.close();
+                break;
+            } catch (Throwable e) { }
+        }
     }
 }
